@@ -3,10 +3,10 @@ from diffractsim.diffractive_elements.lens import Lens_torch
 from diffractsim.diffractive_elements.circular_aperture import CircularAperture_torch
 from diffractsim.light_sources.gaussian_beam import GaussianBeamTorch
 from diffractsim.light_sources.plane_wave import PlaneWaveTorch
-from dict import nm,um,mm
+from dict import nm,um,mm, DEVICE
 from util import cleanup
 from dmd import DMD_Processing
-import os
+
 
 def focal_dist_correction(f1,f2,a2,a3,f_slm):
     """
@@ -40,19 +40,18 @@ def propagation(field, dmd, slm, waist, pupil_radius, misalign):
     """
 
     a1, a2, a3, a4 = misalign
-    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    source = PlaneWaveTorch(device) if waist is None else GaussianBeamTorch(w0=waist, device=device)
+    source = PlaneWaveTorch(DEVICE) if waist is None else GaussianBeamTorch(w0=waist, device=DEVICE)
     field.add(source)
     
     f_lens1 = f_lens2 = 120*mm
     radius_l1 = radius_l2 = 15*mm
     
     image_dmd_proc = dmd.print_image_to_dmd(field.dx, field.Nx)       
-    field.E = field.E* image_dmd_proc.to(dtype=torch.complex64, device=device)
+    field.E = field.E* image_dmd_proc.to(dtype=torch.complex64, device=DEVICE)
 
     del image_dmd_proc
-    cleanup(device)
+    cleanup(DEVICE)
     
     field.propagate(f_lens1*(1+a1))
 

@@ -1,40 +1,7 @@
-# import cupy as cp
-import torch
-import gc
-import sys
-import math
-import os
-import random
-import matplotlib.pyplot as plt
-import numpy as np
+import torch, gc, sys, math, os, random, matplotlib.pyplot as plt, numpy as np, torch.nn.functional as F
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-import torch.nn.functional as F
 from datetime import datetime
-
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-def make_dc_random_pair(H, W, dc_max=1.0, device=device):
-    N = H * W
-
-    # Random DC offset for x in [-dc_max, dc_max]
-    # c_x = (2.0 * torch.rand(1, device=device) - 1.0) * dc_max  # scalar
-    c_y = (2.0 * torch.rand(1, device=device) - 1.0) * dc_max # scalar
-
-    # print(c_x)
-    print(c_y)
-    # i.i.d. noise in [-1, 1] for x, [0,1] for y
-    noise_x = 2.0 * torch.rand(N, device=device) - 1.0
-    noise_y = torch.rand(N, device=device)
-
-    x_flat = noise_x
-
-    y_flat = noise_y +c_y
-    y_flat = torch.clamp(y_flat, 0, 1)
-
-
-    x = x_flat.view(H, W)
-    y = y_flat.view(H, W)
-    return x, y
+from dict import DEVICE
 
 
 def digital_dot_product(A,B):
@@ -56,11 +23,8 @@ def define_limits_camera_ADC(dim, bright, low_pct=0.00, high_pct=1.00):
     # span is always positive
     span = (bright - dim).clamp_min(eps) / max(b - a, eps)
 
-    # initial lo/hi
     lo = dim - a * span
-    # cap lo at 0.0 if negative (broadcast-safe)
     lo = torch.maximum(lo, torch.zeros_like(lo))
-    # keep the same span
     hi = lo + span
 
     return lo, hi  # in [0, 2^bits - 1]
@@ -178,15 +142,6 @@ def create_outcome_dir(title):
     print(f"[INFO] Saving outputs to: {full_path}")
     return full_path  # Optional, in case you want to keep track
 
-# def go_to_unlabeled_tests():
-#     target_dir = os.path.join('outcomes', 'unlabeled_tests')
-    
-#     if not os.path.isdir(target_dir):
-#         raise FileNotFoundError(f"[ERROR] Directory '{target_dir}' does not exist.")
-    
-#     os.chdir(target_dir)
-#     print(f"[INFO] Changed working directory to: {target_dir}")
-#     return target_dir
 
 def go_to_unlabeled_tests():
     target_dir = os.path.join("outcomes", "unlabeled_tests")
@@ -195,26 +150,20 @@ def go_to_unlabeled_tests():
     print(f"[INFO] Changed working directory to: {target_dir}")
     return target_dir
 
-def coarse_uniform_01(H, W, cells=3, device='cpu'):
-    # draw on a tiny grid, then bilinear upsample
-    z = torch.rand(1, 1, cells, cells, device=device)
-    y = F.interpolate(z, size=(H, W), mode='bilinear', align_corners=True)[0,0]
-    # strictly [0,1]
-    return y
-
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     
-def auto_T_for_energy(ee_target: float = 0.98) -> float:
+def auto_T_for_energy(ee_target = 0.98) -> float:
     """Return T so a 2D Gaussian truncated at R=T·σ contains ee_target encircled energy."""
     ee_target = float(min(max(ee_target, 0.5), 0.9999))
     return math.sqrt(-2.0 * math.log(1.0 - ee_target))
 
-def gaussian_kernel_isotropic2d(sig_x_samp: float, sig_y_samp: float,
-                                ee_target: float, device, ctype):
+
+def gaussian_kernel_isotropic2d(sig_x_samp, sig_y_samp,
+                                ee_target, device, ctype):
     """Build a normalized 2D Gaussian kernel (possibly elliptical in samples), auto-sized for >ee_target energy."""
     if sig_x_samp <= 0.0 or sig_y_samp <= 0.0:
         return torch.ones((1, 1, 1, 1), device=device, dtype=ctype)  # identity
@@ -222,7 +171,7 @@ def gaussian_kernel_isotropic2d(sig_x_samp: float, sig_y_samp: float,
     T = auto_T_for_energy(ee_target)
     Rx = T * sig_x_samp
     Ry = T * sig_y_samp
-    kx = max(3, int(2 * math.ceil(Rx) + 1) | 1)  # odd, ≥3
+    kx = max(3, int(2 * math.ceil(Rx) + 1) | 1) 
     ky = max(3, int(2 * math.ceil(Ry) + 1) | 1)
 
     ax = torch.arange(kx, device=device, dtype=torch.float32) - (kx - 1) / 2
@@ -232,11 +181,11 @@ def gaussian_kernel_isotropic2d(sig_x_samp: float, sig_y_samp: float,
     K = K / torch.clamp(K.sum(), min=1e-12)
     return K.to(ctype).unsqueeze(0).unsqueeze(0)  # [1,1,ky,kx]
 
-def blur_phase_crosstalk_isotropic(phase_hw: torch.Tensor,
-                                   sigma_slm_px: float,   # σ in SLM pixels (isotropic). 0 => no cross-talk
-                                   pitch_m: float,        # SLM pixel pitch (m)
-                                   dx_m: float, dy_m: float,  # high-res sampling (m/sample)
-                                   ee_target: float = 0.98) -> torch.Tensor:
+def blur_phase_crosstalk_isotropic(phase_hw,
+                                   sigma_slm_px,
+                                   pitch_m,
+                                   dx_m, dy_m,
+                                   ee_target = 0.98) -> torch.Tensor:
     """Isotropic cross-talk: blur e^{iφ} with a Gaussian whose σ is given in SLM pixels; wrap-safe."""
     if sigma_slm_px <= 0.0:
         return phase_hw  # no cross-talk
@@ -247,14 +196,14 @@ def blur_phase_crosstalk_isotropic(phase_hw: torch.Tensor,
 
     ctype = (torch.complex64 if phase_hw.dtype in (torch.float16, torch.bfloat16, torch.float32)
              else torch.complex128)
-    E = torch.exp(1j * phase_hw.to(torch.float32)).to(ctype)          # [H,W] complex
+    E = torch.exp(1j * phase_hw.to(torch.float32)).to(ctype)
     K = gaussian_kernel_isotropic2d(sig_x_samp, sig_y_samp, ee_target,
                                     device=phase_hw.device, ctype=ctype)
 
-    x = E.unsqueeze(0).unsqueeze(0)                                   # [1,1,H,W]
+    x = E.unsqueeze(0).unsqueeze(0)
     pad_y, pad_x = K.shape[2] // 2, K.shape[3] // 2
     x = F.pad(x, (pad_x, pad_x, pad_y, pad_y), mode="reflect")
-    y = F.conv2d(x, K, padding=0)[0, 0]                               # [H,W] complex
+    y = F.conv2d(x, K, padding=0)[0, 0]                     
 
-    y = y / torch.clamp(y.abs(), min=1e-12)                           # phase-only SLM
+    y = y / torch.clamp(y.abs(), min=1e-12)
     return torch.angle(y).to(phase_hw.dtype)

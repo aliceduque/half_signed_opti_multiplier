@@ -1,18 +1,14 @@
-import torch
-import math
-import numpy as np
-from dict import arccos_from_lut
+import torch, math, numpy as np, torch.nn.functional as F
+from dict import arccos_from_lut, DEVICE
 from util import plot_figure, blur_phase_crosstalk_isotropic
 from diffractsim.diffractive_elements import DOE
-import torch.nn.functional as F
 
 
 class SLM_Processing():
     def __init__(self, slm, image):
         self.slm = slm
         self.image = image
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-
+        self.device = DEVICE
         
     def verify_feasibility(self, vector_side, cluster_size, active_area_ratio, num_lenslets):
         # self.cluster_size = cluster_size

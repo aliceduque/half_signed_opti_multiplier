@@ -1,14 +1,6 @@
-import numpy as np
-import matplotlib.pyplot as plt
-import torch
-import torch.nn.functional as F
-import math
+import math, torch, numpy as np, torch.nn.functional as F
 from util import plot_figure
-from dict import nm,mm,um
-import os
-
-import math, torch
-import torch.nn.functional as F
+from dict import nm,mm,um, DEVICE
 
 
 def _box1d_kernel(pixel_pitch_over_dx: float, device):

@@ -1,16 +1,15 @@
 import argparse, math, torch, time, random, os, gc
 from pathlib import Path
-from dict import generate_linear_alphabet, generate_dither_alphabet
+from dict import DEVICE, generate_dither_alphabet
 from slm import SLM, SLM_Processing
 from dmd import DMD, DMD_Processing
 from image import Image, set_input_type
 from util import digital_dot_product, set_seed, log_to_file, go_to_unlabeled_tests, create_outcome_dir, calculate_errors, read_camera_ADC, define_limits_camera_ADC
 from capture_and_post_processing import capture_focal_intensity, normalise_to_E0, find_scale_and_bias
 from propagation import propagation
-from diffractsim.monochromatic_simulator import MonochromaticFieldTorch 
+from diffractsim.monochromatic_simulator import MonochromaticFieldTorch
+
 torch.set_grad_enabled(False)
-
-
     
 def opti_product(kwargs):
     title             = kwargs.get("title")
@@ -57,9 +56,9 @@ def opti_product(kwargs):
     x0_dmd = xy_misalign[0]*dmd_pixels*dmd_pitch
     y0_dmd = xy_misalign[1]*dmd_pixels*dmd_pitch
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    print(f"Program running on {device}")
+    print(f"Simulation running on {DEVICE}")
+    
     if seed is not None:
         set_seed(seed)
             
@@ -156,13 +155,14 @@ def opti_product(kwargs):
     print("==== STARTING CALIBRATION ====")
     
     print("Defining brightest pixel level")
+    
 # Camera calibration: defining BRIGHT level
     set_input_type("fully_lit", image_dmd, image_slm)
     image_dmd.set_all_ones()
     image_slm.set_all_ones()
 
 
-    E_capt = torch.zeros((lenslets, lenslets, pix_block_size, pix_block_size), device=device, dtype=torch.float32)
+    E_capt = torch.zeros((lenslets, lenslets, pix_block_size, pix_block_size), device=DEVICE, dtype=torch.float32)
     tau_acc = 0
     for _ in range(calibration_rep):
         E_run, tau_run = propagate_and_read()
@@ -180,13 +180,12 @@ def opti_product(kwargs):
 # Camera calibration: defining BLACK level
     image_dmd.set_all_ones()
     image_slm.set_custom_input(value=-1.0)
-    E_capt = torch.zeros((lenslets, lenslets, pix_block_size, pix_block_size), device=device, dtype=torch.float32)
+    E_capt = torch.zeros((lenslets, lenslets, pix_block_size, pix_block_size), device=DEVICE, dtype=torch.float32)
     for _ in range(calibration_rep):
         E_capt += propagate_and_read()[0]
 
     E_dim = (E_capt / calibration_rep).min()
-    # E_dim = torch.tensor(10.0, device='cuda')
-    # print("E_dim pushed to 10 electrons")
+
     print(f"Lower threshrold E_dim = {E_dim.detach().cpu().numpy()}")
 
     cam_low, cam_high = define_limits_camera_ADC(dim=E_dim, bright=E_bright)
@@ -199,7 +198,7 @@ def opti_product(kwargs):
 # System calibration: defining reference intensity (E0)
     print("Defining reference intensity E0:")
     set_input_type("frame_only", image_dmd, image_slm)
-    E_capt = torch.zeros((lenslets, lenslets, pix_block_size, pix_block_size), device=device, dtype=torch.float32)
+    E_capt = torch.zeros((lenslets, lenslets, pix_block_size, pix_block_size), device=DEVICE, dtype=torch.float32)
     for _ in range(calibration_rep):
         E_capt += propagate_and_read(quantised_reading=True)
 
@@ -245,7 +244,7 @@ def opti_product(kwargs):
         error_metrics = calculate_errors(correct, fitted_optical, lens_wise=True)
         print("\n".join(f"{k}: {v}" for k, v in error_metrics.items()))      
 
-    Path("/outcomes").mkdir(parents=True, exist_ok=True)
+    Path("./outcomes").mkdir(parents=True, exist_ok=True)
 
     if title is not None:
         create_outcome_dir(title)
@@ -256,45 +255,80 @@ def opti_product(kwargs):
     return error_metrics
 
         
-if __name__ == '__main__':
-    
+if __name__ == "__main__":
+
     script_dir = os.path.dirname(os.path.abspath(__file__))
     os.chdir(script_dir)
-    
-    parser = argparse.ArgumentParser(description="Perform a convolution using free space optics")
-    parser.add_argument("--title", default=None, type=str, help="Test title (outcomes folder name). If left blank, outcomes will be saved in \'unlabeled tests\' folder")
-    parser.add_argument("--lenslets", default=1, type=int, help="Number of parallel dot products L**2 to be calculated")
-    parser.add_argument("--input_type", default="random_uncorr", type=str, help="Options: \'fully_lit\', \'frame_only\', \'custom\', \'random\'")
-    parser.add_argument("--dataset", default="cifar", type=str, help="Dataset for Random input type (options: CIFAR and QuickDraw)")
-    parser.add_argument("--input_size", default=45, type=int, help="Vector size to be operated (per side)")
-    parser.add_argument("--wlen", default=650e-9, type=float, help="Beam wavelength")  
-    parser.add_argument("--focal_length", default=425e-3, type=float, help="Focal length of SLM lens phase profile")
-    parser.add_argument("--dmd_pixels", default=1024, type=int, help="Number NxN of pixels in the DMD (per dimension)")
-    parser.add_argument("--slm_pixels", default=1024, type=int, help="Number NxN of pixels in the SLM (per dimension)")
-    parser.add_argument("--active_area_ratio", default=0.4943, type=float, help="Active pixel area / total pixel area. Defines frame width")
-    parser.add_argument("--dx", default=1.0e-6, type=float, help="Field grid resolution")
-    parser.add_argument("--Nx", default=16384, type=int, help="Field grid size (number of cells Nx x Nx)")
-    parser.add_argument("--slm_pitch", default=8e-6, type=float, help="SLM pixel pitch")
-    parser.add_argument("--dmd_pitch", default=8e-6, type=float, help="DMD pixel pitch")
-    parser.add_argument("--cam_adc_bits", default=20, type=int, help="Bit resolution of camera's ADC")    
-    parser.add_argument("--pix_block_size", default=1, type=int, help="Camera ROI size, in pixels KxK")
-    parser.add_argument("--cam_pitch", default=5.0e-6, type=float, help="Camera pixel pitch")    
-    parser.add_argument("--cluster_size", default=16, type=int, help="Cluster size used on DMD for image encoding")
-    parser.add_argument('--scale', default=1.0, type=float, help="Pre-determined scale")
-    parser.add_argument('--bias', default=0.0, type=float, help="Pre-determined bias")
-    parser.add_argument('--runs', default=100, type=int, help="Number of runs performed")
-    parser.add_argument('--find_linear_fit', default=False, type=bool, help="Do many runs and find linear parameters to fit data")
-    parser.add_argument('--seed', default=None, type=int, help="Random seed to be used")
-    parser.add_argument('--pupil', default=None, type=float, help="Pupil radius to be included in the 4f-system fourier plane")
-    parser.add_argument('--waist', default=None, type=float, help="Beam waist after beam expansion")
-    parser.add_argument('--xy_misalign', default=None, type=float, help="XY deviation of SLM with respect to beam central position. (x0,y0) tuple expected in meters")
-    parser.add_argument('--zoom_misalign', default=None, type=float, help="Longitudinal deviation in the 4f relay. (d1,d2,d3,d4) tuple expected in meters")   
-    parser.add_argument('--crosstalk', default=0.0, type=float, help="SLM crosstalk sigma (as a factor of pixel pitch)" )
-    parser.add_argument('--shot_noise', default=False, type=bool, help="Enable shot noise")
-    parser.add_argument('--fwc', default=None, type=int, help="Full Well Capacity of camera")
-    p = parser.parse_args()
 
-    kwargs = vars(p)      
+    parser = argparse.ArgumentParser(
+        description="Perform a dot product using free-space optics.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    parser.add_argument("--title", type=str, default=None,
+                        help="Experiment name (used for output folder naming). If omitted, results go to a default folder.")
+    parser.add_argument("--runs", type=int, default=100, help="Number of runs to perform.")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed. If omitted, uses random seed.")
+
+    parser.add_argument(
+        "--input_type",
+        type=str,
+        default="random_uncorr",
+        choices=["random_uncorr", "figure", "random_uncorr_sorted", "figure_sorted", "custom", "fully_lit", "frame_only"],
+        help="Input type / generation mode.",
+    )
+    parser.add_argument("--dataset", type=str, default="cifar", choices=["cifar", "celeb"],
+                        help="Dataset used when input_type='figure'.")
+
+    parser.add_argument("--lenslets", type=int, default=1,
+                        help="Number of lenslets per axis (total dot products = lenslets^2).")
+    parser.add_argument("--input_size", type=int, default=45,
+                        help="Vector side length (N): total elements = N^2.")
+
+    parser.add_argument("--wlen", type=float, default=650e-9, help="Wavelength [m].")
+    parser.add_argument("--focal_length", type=float, default=425e-3,
+                        help="Focal length of SLM lens phase profile [m].")
+    parser.add_argument("--pupil", type=float, default=None,
+                        help="Fourier-plane pupil radius [m]. If omitted, no pupil is applied.")
+    parser.add_argument("--waist", type=float, default=None,
+                        help="Beam waist after expansion [m]. If omitted, perfect plane wave is assumed")
+
+    parser.add_argument("--dmd_pixels", type=int, default=1024, help="DMD resolution per axis (pixels).")
+    parser.add_argument("--slm_pixels", type=int, default=1024, help="SLM resolution per axis (pixels).")
+    parser.add_argument("--active_area_ratio", type=float, default=0.4943,
+                        help="Active/total pixel area (defines frame width).")
+    parser.add_argument("--dmd_pitch", type=float, default=8e-6, help="DMD pixel pitch [m].")
+    parser.add_argument("--slm_pitch", type=float, default=8e-6, help="SLM pixel pitch [m].")
+
+    parser.add_argument("--dx", type=float, default=1.0e-6, help="Simulation sampling interval dx [m].")
+    parser.add_argument("--Nx", type=int, default=16384, help="Simulation grid size (Nx x Nx).")
+
+    parser.add_argument("--cam_pitch", type=float, default=3.0e-6, help="Camera pixel pitch [m].")
+    parser.add_argument("--cam_adc_bits", type=int, default=20, help="Camera ADC resolution [bits].")
+    parser.add_argument("--pix_block_size", type=int, default=1, help="Camera capture block size [pixels].")
+    parser.add_argument("--fwc", type=int, default=None,
+                        help="Full well capacity [electrons]. If omitted, estimated from pixel area.")
+
+    parser.add_argument("--cluster_size", type=int, default=16,
+                        help="DMD cluster size used for encoding (defines bit depth).")
+
+    parser.add_argument("--scale", type=float, default=1.0, help="Pre-determined scale (if not fitting).")
+    parser.add_argument("--bias", type=float, default=0.0, help="Pre-determined bias (if not fitting).")
+    parser.add_argument("--find_linear_fit", action="store_true",
+                        help="Estimate linear scale/bias mapping optical values to digital values after running.")
+
+    parser.add_argument("--xy_misalign", type=float, nargs=2, default=None, metavar=("X0", "Y0"),
+                        help="Transverse misalignment [m]. Usage: --xy_misalign x0 y0")
+    parser.add_argument("--zoom_misalign", type=float, nargs=4, default=None, metavar=("D1", "D2", "D3", "D4"),
+                        help="4f relay distance deviations [m]. Usage: --zoom_misalign d1 d2 d3 d4")
+
+    parser.add_argument("--crosstalk", type=float, default=0.0,
+                        help="SLM crosstalk sigma (in units of SLM pixel pitch).")
+    parser.add_argument("--shot_noise", action="store_true", help="Enable shot-noise sampling.")
+
+    p = parser.parse_args()
+    kwargs = vars(p)
     opti_product(kwargs)
-            
+
+
     

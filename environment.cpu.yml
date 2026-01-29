@@ -9,10 +9,6 @@ dependencies:
   - python=3.8.20
   - setuptools=75.1.0
   - sqlite=3.51.1
-  - ucrt=10.0.22621.0
-  - vc=14.3
-  - vc14_runtime=14.44.35208
-  - vs2015_runtime=14.44.35208
   - wheel=0.44.0
   - pip:
       - beautifulsoup4==4.14.3
@@ -21,7 +17,7 @@ dependencies:
       - colorama==0.4.6
       - contourpy==1.1.1
       - cycler==0.12.1
-      - diffractsim==2.2.8
+      - "diffractsim @ git+https://github.com/aliceduque/diffractsim.git@002ddf37251551b4b8b2844af8e6a209fb6ceca6"
       - filelock==3.16.1
       - fonttools==4.57.0
       - fsspec==2025.3.0

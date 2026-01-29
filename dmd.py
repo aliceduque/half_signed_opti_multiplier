@@ -1,6 +1,7 @@
 import torch, math, torch.nn.functional as F 
 from util import plot_figure
 
+
 class DMD:
     alphabet = None
     def __init__(self, pitch, num_pixels, x0, y0):
@@ -37,9 +38,6 @@ class DMD_Processing:
             print(f'[DMD] Feasibility verified. Frame width = {self.frame_width}px, total area occupied = {self.total_area}px')
     
     def print_image_to_dmd(self, field_dx, field_size):
-        """
-
-        """
         dmd_out = self.flip_image(self.tile_windows(self.frame_windows(self.modulate_clusters())))
         
         ## Uncomment to plot DMD modulation
@@ -71,10 +69,7 @@ class DMD_Processing:
 
     
     def frame_windows(self, mod_image):
-        """
-        Append a frame of width self.frame_width around each (B,H,W) image.
-        Output shape: (B, H + 2*fw, W + 2*fw).
-        """
+
         fw = int(self.frame_width)
         if fw <= 0:
             return mod_image

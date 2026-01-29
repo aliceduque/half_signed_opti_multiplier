@@ -1,13 +1,11 @@
-import os, torch, random, numpy as np, torchvision
-import torch.nn.functional as F
+import os, torch, random, torchvision, numpy as np, torch.nn.functional as F
 from PIL import Image as PILImage
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 from torch.utils.data import Dataset
-from util import quantise, make_dc_random_pair, plot_figure, coarse_uniform_01
-
+from util import quantise, plot_figure
+from dict import DEVICE
 def set_input_type(input_type, image_dmd, image_slm, dataset=None):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
 
     if input_type == 'fully_lit':
         image_dmd.set_all_ones()
@@ -42,6 +40,7 @@ def set_input_type(input_type, image_dmd, image_slm, dataset=None):
         image_dmd.image_out = y_sorted 
     
     if input_type == 'custom':
+        # Set arbitrary uniform vectors for testing purposes
         image_dmd.set_custom_input(value=1.0)
         image_slm.set_custom_input(value=-0.4)
         
@@ -53,9 +52,9 @@ def set_input_type(input_type, image_dmd, image_slm, dataset=None):
         slm_raw_list = []
         
         for _ in range(l):
-            x = 2.0 * torch.rand(h, w, device=device) - 1.0  # SLM [-1,1]
+            x = 2.0 * torch.rand(h, w, device=DEVICE) - 1.0  # SLM [-1,1]
             x = quantise(x=x, lo=-1, hi=1, levels=2**(image_dmd.bit_depth)+1)
-            y = torch.rand(h, w, device=device)              # DMD [0,1]
+            y = torch.rand(h, w, device=DEVICE)              # DMD [0,1]
             y = quantise(x=y, lo=0, hi=1, levels=2**(image_dmd.bit_depth)+1)
 
             slm_raw_list.append(x)
@@ -74,9 +73,9 @@ def set_input_type(input_type, image_dmd, image_slm, dataset=None):
         dmd_sorted_list = []
 
         for _ in range(l):
-            x = 2.0 * torch.rand(h, w, device=device) - 1.0  # SLM [-1,1]
+            x = 2.0 * torch.rand(h, w, device=DEVICE) - 1.0  # SLM [-1,1]
             x = quantise(x=x, lo=-1, hi=1, levels=2**(image_dmd.bit_depth)+1)
-            y = torch.rand(h, w, device=device)              # DMD [0,1]
+            y = torch.rand(h, w, device=DEVICE)              # DMD [0,1]
             y = quantise(x=y, lo=0, hi=1, levels=2**(image_dmd.bit_depth)+1)
             x_sorted, y_sorted = sort_pair_along_zigzag(x, y)
 
@@ -114,7 +113,7 @@ def zigzag_path_indices(H, W, device=None):
 
         indices.extend(diag)
 
-    return torch.tensor(indices, dtype=torch.long, device=device)
+    return torch.tensor(indices, dtype=torch.long, device=DEVICE)
 
 
 def sort_pair_along_zigzag(x, y):
@@ -160,7 +159,7 @@ class Image:
         self.image_size = image_size
         self.num_lenslets = num_lenslets
         self.bit_depth = bit_depth
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = DEVICE
         self.cifar = None
         self.quickdraw = None
         self.image_raw = None
@@ -206,19 +205,6 @@ class Image:
         maxs = x.amax(dim=(1,2), keepdim=True)
         den  = (maxs - mins).clamp_min(1e-12)
         return ((x - mins) / den).clamp_(0.0, 1.0)
-    
-    def set_random_vector(self):
-        B=self.num_lenslets**2
-        vec = torch.stack(
-            [coarse_uniform_01(self.image_size, self.image_size, cells=3, device=self.device)
-            for _ in range(B)],
-            dim=0)
-        vec = self.expand_per_image(vec)
-        levels = 2 ** self.bit_depth
-        vec = quantise(vec,0.0, 1.0, levels)
-        self.image_out = vec.to(self.device, non_blocking=True) 
-        # plot_figure(self.image_out[0], title='raw')
-        return self.image_out
 
     def set_random_figure(self, dataset, start_index, N):
         if dataset == "cifar":
@@ -226,21 +212,15 @@ class Image:
         elif dataset == "celeb":
             ds = self.get_celeb()
         
-        # N  = self.num_lenslets ** 2
-        # make a contiguous block of indices, wrapping if needed
         idxs = [(start_index + i) % len(ds) for i in range(N)]
-        # fetch all N samples, stack to (N,1,H,W)
         imgs = torch.stack([ds[i][0] for i in idxs], dim=0)  # CPU, float32
         imgs = imgs.squeeze(1)                               # (N,H,W)
 
-        # optional per-image expand + quantize to bit_depth
         imgs = self.expand_per_image(imgs)
         levels = 2 ** self.bit_depth
         imgs = quantise(imgs,0.0, 1.0, levels)
-        # imgs = torch.round(imgs * (levels - 1)) / (levels - 1)
 
         self.image_out = imgs.to(self.device, non_blocking=True)  # (N,H,W)
-        # plot_figure(self.image_out[0])
         return self.image_out
 
     def set_all_zeros(self):
@@ -261,34 +241,9 @@ class Image:
         
         return self.image_out
     
-    def set_kernel(self, kernel):
-        self.image_out = kernel.unsqueeze(0).repeat(self.num_lenslets**2, 1, 1) 
 
     def expand_to_negative_values(self):
         self.image_out = self.image_out * 2 - 1.0
         # plot_figure(self.image_out[0], title='negatives')
         return self.image_out
     
-
-    def unwrap_convolution_windows(self, img, kernel_size):
-        self.img_full = img
-        k = kernel_size
-        # accept (H,W) or (1,H,W)
-        x = img if img.dim() == 2 else img[0]            # (H,W)
-        H, W = x.shape
-
-        # SAME output size with stride=1 (asymmetric pad if k is even)
-        pad_left  = k // 2
-        pad_right = k - 1 - pad_left
-        pad_top   = k // 2
-        pad_bot   = k - 1 - pad_top
-
-        # replicate-pad and extract all k×k windows centered at each pixel
-        x4   = x.unsqueeze(0).unsqueeze(0)               # (1,1,H,W)
-        xpad = F.pad(x4, (pad_left, pad_right, pad_top, pad_bot), mode='replicate')
-        patches = xpad.unfold(2, k, 1).unfold(3, k, 1)   # (1,1,H,W,k,k)
-        patches = patches.squeeze(0).squeeze(0)          # (H,W,k,k)
-        patches = patches.contiguous().view(H*W, k, k)   # (N,k,k) with N = H*W
-
-        self.image_out = patches
-        return patches
