@@ -8,10 +8,9 @@ import torch.nn.functional as F
 
 
 class SLM_Processing():
-    def __init__(self, slm, image, image2=None):
+    def __init__(self, slm, image):
         self.slm = slm
         self.image = image
-        self.image2 = image2
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
         
@@ -32,45 +31,20 @@ class SLM_Processing():
     def set_phase_mask(self):        
         phase_mask = self.tile_windows((self.create_lenslet() + self.image_to_phase_and_frame(self.image)))
         # plot_figure(torch.remainder(phase_mask, 2 * torch.pi)-torch.pi, "Phase Mask", "Phase (rad)")
-        self.slm.set_mask(phase_mask)
-    
-    def set_composite_phase_mask(self):
-        composite_mask = self.image_to_phase_and_frame(self.image) + self.image_to_phase_and_frame(self.image2, orientation='vertical')
-        full_mask = self.tile_windows((self.create_lenslet() + composite_mask))
-        # plot_figure(torch.remainder(composite_mask[0], 2 * torch.pi), "phase mask full")
-        self.slm.set_mask(full_mask)
-    
-    
-        
+        self.slm.set_mask(phase_mask)        
 
-        
-
-    def image_to_phase_and_frame(self, image, orientation = "horizontal"):
+    def image_to_phase_and_frame(self, image):
         assert image.image_out.any() <= 1 and image.image_out.any() >= -1, \
             "Vector to be encoded in SLM falls outside [-1,1] limits"
 
         phase  = arccos_from_lut(image.image_out)
         device = image.image_out.device
         K, R, C = phase.shape
-
         # Base pattern
-        if self.slm.chequered:
-            i = torch.arange(self.cluster_size, device=device).view(-1, 1)
-            j = torch.arange(self.cluster_size, device=device).view(1, -1)
-            base_pattern = ((i + j) % 2) * -2 + 1  # checkerboard ±1
-        else:
-            half = self.cluster_size // 2
-            if orientation == "horizontal":
-                row = torch.arange(self.cluster_size, device=device)
-                row_sign = torch.where(row < half, 1.0, -1.0).view(-1, 1)
-                base_pattern = row_sign.repeat(1, self.cluster_size)     # horizontal stripes ±1
-            elif orientation == "vertical":
-                col = torch.arange(self.cluster_size, device=device)
-                col_sign = torch.where(col < half, 1.0, -1.0).view(1, -1)
-                base_pattern = col_sign.repeat(self.cluster_size, 1)     # vertical stripes ±1
-            else:
-                raise ValueError("orientation must be 'horizontal' or 'vertical'")
-
+        half = self.cluster_size // 2
+        row = torch.arange(self.cluster_size, device=device)
+        row_sign = torch.where(row < half, 1.0, -1.0).view(-1, 1)
+        base_pattern = row_sign.repeat(1, self.cluster_size)     # horizontal stripes ±1
         # Expand scalar kernel values into m×m blocks
         blocks = phase[..., None, None] * base_pattern  # [K, R, C, m, m]
 
@@ -90,7 +64,6 @@ class SLM_Processing():
             value=0.0
         ).to(device)
         
-        # plot_figure(padded[0], title='modulated')
 
         return padded
     
@@ -104,22 +77,15 @@ class SLM_Processing():
         y = torch.linspace(-(N - 1) / 2 * self.slm.pitch, (N - 1) / 2 * self.slm.pitch, N, device=self.device)
         xx, yy = torch.meshgrid(x, y, indexing='xy')
 
-        # r = torch.sqrt(xx ** 2 + yy ** 2)
         r2  = xx*xx + yy*yy
 
         phase_mask = -k* (torch.sqrt(self.slm.focal_length**2 + r2) - self.slm.focal_length)   
         
-        # print(phase_mask[370:380, 370:380])
-        # print(torch.remainder(phase_mask[370:380, 370:380], 2 * torch.pi))
-        
         replicas = phase_mask.unsqueeze(0).repeat(self.num_lenslets**2, 1, 1)  
-        # plot_figure(torch.remainder(replicas[0], 2 * torch.pi)-torch.pi, "phase mask")
         return replicas
 
     
     def tile_windows(self, framed_windows):
-        # in:  (B, h, w) with B a perfect square
-        # out: (1, G*h, G*w) where G = sqrt(B)
         B, h, w = framed_windows.shape
         G = int(math.isqrt(B))
         assert G*G == B, "B must be a perfect square"
@@ -129,11 +95,9 @@ class SLM_Processing():
     def get_device(self):
         return self.slm
     
-
-    
     
 class SLM(DOE):
-    def __init__(self, Nx, Ny, pitch, fill_factor, wlen, focal_length, chequered, x0=0, y0=0, crosstalk_sigma=0.0):
+    def __init__(self, Nx, Ny, pitch, fill_factor, wlen, focal_length, x0=0, y0=0, crosstalk_sigma=0.0):
         """
         Nx, Ny : number of SLM pixels in x and y
         pitch : physical size of each SLM pixel
@@ -148,7 +112,6 @@ class SLM(DOE):
         self.y0 = y0
         self.wlen = wlen
         self.focal_length = focal_length
-        self.chequered = chequered
         self.Nx = Nx
         self.Ny = Ny
         self.pitch = pitch
@@ -168,8 +131,6 @@ class SLM(DOE):
 
         slit_px_x = int(pitch_px_x * np.sqrt(self.fill_factor))
         slit_px_y = int(pitch_px_y * np.sqrt(self.fill_factor))
-
-        # print(f"[INFO] Pitch: {pitch_px_y}×{pitch_px_x} px | Slit: {slit_px_y}×{slit_px_x} px")
 
         cell = torch.zeros((pitch_px_y, pitch_px_x), dtype=torch.float32, device=self.device)
 
@@ -242,7 +203,10 @@ class SLM(DOE):
 
         slm_transmittance = self.fast_generate_slm_grid_with_fill(dx, dy) * torch.exp(1j * expanded_phase)
         t = self.embed_slm_into_field(slm_transmittance, xx.shape)
-        # plot_or_save(torch.angle(t), "slm", plot='show')
+        
+        ## Uncomment for focal-spot intensity plot ##
+        # plot_figure(torch.angle(t), title="SLM phase mask")
+
         return t
     
     

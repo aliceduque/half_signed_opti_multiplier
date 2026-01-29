@@ -13,29 +13,7 @@ from datetime import datetime
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-def frac_to_filename(val, digits: int = 4) -> str:
-    """
-    Convert a small signed value in (-1, 1) to a filename-safe string.
-    Examples:
-      -0.1482 -> "-1482"
-       0.0768 -> "0768"
-    """
-    # accept torch tensors or plain numbers
-    if isinstance(val, torch.Tensor):
-        val = float(val.detach().cpu().item())
-    elif not isinstance(val, (int, float)):
-        raise TypeError("val must be a float or a scalar torch.Tensor")
-
-    if math.isnan(val) or math.isinf(val):
-        raise ValueError("val must be finite")
-
-    sign = "-" if val < 0 else ""
-    n = int(round(abs(val) * (10 ** digits)))  # round to requested digits
-    # clamp to max representable (handles 0.99995 rounding to 10000)
-    n = min(n, 10**digits - 1)
-    return f"{sign}{n:0{digits}d}"
-
-def make_dc_random_pair(H, W, dc_max=1.0, device="cuda"):
+def make_dc_random_pair(H, W, dc_max=1.0, device=device):
     N = H * W
 
     # Random DC offset for x in [-dc_max, dc_max]
@@ -47,15 +25,6 @@ def make_dc_random_pair(H, W, dc_max=1.0, device="cuda"):
     # i.i.d. noise in [-1, 1] for x, [0,1] for y
     noise_x = 2.0 * torch.rand(N, device=device) - 1.0
     noise_y = torch.rand(N, device=device)
-
-    # Scale noise so |c_x| + noise_amp_x <= 1 => no clipping in [-1,1]
-    # noise_amp_x = 1.0 - c_x.abs()  # scalar in (0,1]
-    
-    # x_flat = c_x + noise_amp_x * noise_x    # guaranteed in [-1,1]
-    # y_flat = noise_y                        # already in [0,1]
-    # x_flat = noise_x + c_x
-    # x_flat = torch.clamp(x_flat, -1, 1)
-    # y_flat = noise_y
 
     x_flat = noise_x
 
@@ -73,81 +42,9 @@ def digital_dot_product(A,B):
     out = (A * B).sum(axis=(1, 2))   
     return out.reshape(int(np.sqrt(l)), int(np.sqrt(l))) / (s*s)
 
-def digital_convolution(img,kernel):
-    if not torch.is_tensor(kernel):
-        kernel = torch.tensor(kernel, dtype=torch.float32)
-
-    k = kernel.shape[0]
-    # accept (H,W) or (1,H,W)
-    print(img.shape)
-    _, H, W = img.shape
-
-    # SAME output size with stride=1 (asymmetric pad if k is even)
-    pad_left  = k // 2
-    pad_right = k - 1 - pad_left
-    pad_top   = k // 2
-    pad_bot   = k - 1 - pad_top
-    img = img.float().unsqueeze(0)  # [1, 1, H, W]
-    kernel = kernel.float().unsqueeze(0).unsqueeze(0)  # [1, 1, kH, kW]
-
-    img_padded = F.pad(img, (pad_left, pad_right, pad_top, pad_bot), mode='replicate')
-    result = F.conv2d(img_padded, kernel)  # [B, 1, H, W]
-    result = result.squeeze(0).squeeze(0)  # [B, H, W]
-    return result
-
-
-# def parse_and_create_matrix(str_matrix):
-#     rows = str_matrix.strip().split(';')
-#     return cp.array([[float(num) for num in row.strip().split()] for row in rows])
-
-def parse_and_create_matrix(str_matrix, dtype=torch.float32, device="cuda"):
-    # rows separated by ';', numbers separated by whitespace
-    rows = [list(map(float, r.strip().split()))
-            for r in str_matrix.strip().split(';') if r.strip()]
-    return torch.tensor(rows, dtype=dtype, device=device)
-
-def z_normalise(image: torch.Tensor) -> torch.Tensor:
-    """
-    Z-normalizes a PyTorch image tensor to zero mean and unit std.
-    Works on a 2D or 3D tensor (e.g., [H, W] or [1, H, W]).
-    """
-    mean = image.mean()
-    std = image.std()
-    return (image - mean) / (std + 1e-8)
-
-
-def split_positive_negative(tensor: torch.Tensor) -> torch.Tensor:
-    pos = torch.clamp(tensor, min=0)
-    neg = torch.clamp(tensor, max=0)
-    return torch.stack([pos, neg], dim=0)
-
-
 def quantise(x, lo, hi, levels):
     s = (levels - 1) / (hi - lo)
     return torch.round((x.clamp(lo, hi) - lo) * s) / s + lo
-
-# def camera_ADC(x, dim, bright, bits):
-#     levels = 2**bits
-#     step = (bright - dim) / torch.floor(0.9*levels)
-#     highest = bright / 0.95
-#     lowest = highest - step*levels
-#     return quantise(x,lowest,highest,levels)
-
-# def camera_ADC(x, dim, bright, bits, low_pct=0.05, high_pct=0.95):
-#     x      = torch.as_tensor(x)
-#     dim    = torch.as_tensor(dim,    device=x.device, dtype=x.dtype)
-#     bright = torch.as_tensor(bright, device=x.device, dtype=x.dtype)
-
-#     eps = torch.finfo(x.dtype).eps
-#     a, b = float(low_pct), float(high_pct)
-#     span = (bright - dim).clamp_min(eps) / max(b - a, eps)
-#     lo   = dim - a * span
-#     hi   = lo + span
-#     print('lo: ', lo)
-#     print('hi: ', hi)
-#     levels = (1 << int(bits)) - 1
-#     codes = torch.round((x.clamp(lo, hi) - lo) * levels / (hi - lo)).to(torch.int32)
-#     return codes  # in [0, 2^bits-1]
 
 def define_limits_camera_ADC(dim, bright, low_pct=0.00, high_pct=1.00):
     dim    = torch.as_tensor(dim,    device=dim.device, dtype=dim.dtype)
@@ -173,10 +70,6 @@ def read_camera_ADC(x, lo, hi, bits):
     codes = torch.round((x.clamp(lo, hi) - lo) * levels / (hi - lo)).to(torch.int32)
     return codes # in [0, 2^bits - 1]
 
-# def empty_cache():
-#     torch.cuda.synchronize()
-#     torch.cuda.empty_cache()     # frees cached GPU blocks (and some pinned host caches)
-#     gc.collect() 
     
 def cleanup(device=None):
     gc.collect()
@@ -184,96 +77,19 @@ def cleanup(device=None):
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
     
-# def plot_figure(x, title="", cmap='gray'):
-#     if isinstance(x, torch.Tensor):
-#         x = x.detach().cpu().numpy()
-    
-#     elif isinstance(x, cp.ndarray):
-#         x = cp.asnumpy(x)
-#     plt.figure()
-#     plt.imshow(x, cmap=cmap)
-#     plt.title(title)
-#     plt.axis('off')
-#     plt.colorbar()
-#     plt.show()
-#     plt.close()
 
 def plot_figure(x, title="", cbar_label="", cmap='gray'):
     if isinstance(x, torch.Tensor):
         x = x.detach().cpu().numpy()
-    # elif isinstance(x, cp.ndarray):
-    #     x = cp.asnumpy(x)
     plt.figure()
     im = plt.imshow(x, cmap=cmap)
     plt.title(title, fontsize=16)
     plt.axis('off')
     cbar = plt.colorbar(im)
-    cbar.set_label(cbar_label, fontsize=20)     # bigger colorbar label
-    cbar.ax.tick_params(labelsize=20, length=6, width=1)  # bigger ticks & tick labels
+    cbar.set_label(cbar_label, fontsize=20)
+    cbar.ax.tick_params(labelsize=20, length=6, width=1) 
     plt.show()
     plt.close()
-
-
-
-    
-import matplotlib.pyplot as plt
-import torch
-
-# Make CuPy optional
-try:
-    import cupy as cp
-except Exception:
-    cp = None
-
-# def plot_figure(x, title: str = "", cmap: str = "gray"):
-#     """Plot an array/tensor and return the Matplotlib (fig, ax) for later saving.
-
-#     Parameters
-#     ----------
-#     x : array-like | torch.Tensor | cupy.ndarray
-#         Image data to display.
-#     title : str
-#         Title for the plot.
-#     cmap : str
-#         Matplotlib colormap name.
-
-#     Returns
-#     -------
-#     fig, ax : matplotlib.figure.Figure, matplotlib.axes.Axes
-#         Handles you can use to save/close later.
-#     """
-#     # Convert to NumPy if needed
-#     if isinstance(x, torch.Tensor):
-#         x = x.detach().cpu().numpy()
-#     elif cp is not None and isinstance(x, cp.ndarray):
-#         x = cp.asnumpy(x)
-
-#     fig, ax = plt.subplots()
-#     im = ax.imshow(x, cmap=cmap)
-#     ax.set_title(title)
-#     ax.axis("off")
-
-#     fig.tight_layout()
-#     # Show but do NOT close; caller can save & close later
-#     plt.show()
-
-#     return fig, ax
-
-    
-
-def get_unique_filename(base_name, ext):
-
-    filename = f"{base_name}{ext}"
-    if not os.path.exists(filename):
-        return filename
-
-    i = 1
-    while True:
-        filename = f"{base_name}_{i:02d}{ext}"
-        if not os.path.exists(filename):
-            return filename
-        i += 1
-    
 
 def calculate_errors(y_true, y_pred, lens_wise=False):
     r,l,_ = y_true.shape
@@ -294,27 +110,16 @@ def calculate_errors(y_true, y_pred, lens_wise=False):
     nrmse_range = rmse / range_diff if range_diff.all() != 0 else np.nan
     nrmse_mean = rmse / y_true.mean(axis=axis) if y_true.mean(axis=axis).all() != 0 else np.nan
 
-
     return {
-        'MSE': mse,
-        'RMSE': rmse,
-        'MAE': mae,
-        'R2': r2,
-        'NRMSE (range normalized)': nrmse_range,
-        'NRMSE (mean normalized)': nrmse_mean,
-        'SNR_dB': snr_db
+        'MSE': mse.reshape(l,l),
+        'RMSE': rmse.reshape(l,l),
+        'MAE': mae.reshape(l,l),
+        'R2': r2.reshape(l,l),
+        'NRMSE (range normalized)': nrmse_range.reshape(l,l),
+        'NRMSE (mean normalized)': nrmse_mean.reshape(l,l),
+        'SNR_dB': snr_db.reshape(l,l)
     }
 
-def get_psnr(x, y):
-    """PSNR (dB) for two (H, W) images; data_range inferred from both."""
-    assert x.shape == y.shape and x.ndim == 2
-    x = x.to(torch.float64)
-    y = y.to(torch.float64)
-    vmin = torch.min(x.min(), y.min())
-    vmax = torch.max(x.max(), y.max())
-    data_range = (vmax - vmin).clamp_min(1e-12)
-    mse = torch.mean((x - y) ** 2).clamp_min(1e-20)
-    return 10.0 * torch.log10((data_range * data_range) / mse)
 
 def save_fitting_plot(y, y_pred):
     plt.figure()
@@ -325,10 +130,9 @@ def save_fitting_plot(y, y_pred):
     plt.legend()
     plt.tight_layout()
     plt.savefig("fitting_plot.png")
-    # plt.show()
     plt.close()
         
-def log_to_file(kwargs, y, y_pred):
+def log_to_file(kwargs, y, y_pred, errors):
     with open('log.txt', "w") as file:
         # Save the exact command line if available
         file.write("Called via function:\n\n")
@@ -338,8 +142,7 @@ def log_to_file(kwargs, y, y_pred):
             file.write(f"{key}: {value}\n")
         file.write("\n")
         if y is not None and y.shape[0]!=1:
-            file.write("=== Errors ===\n")
-            errors = calculate_errors(y,y_pred)
+            file.write("=== Errors ===\n")            
             for metric, value in errors.items():
                 file.write(f"{metric}: {value}\n")
             file.write("\n")
@@ -375,35 +178,22 @@ def create_outcome_dir(title):
     print(f"[INFO] Saving outputs to: {full_path}")
     return full_path  # Optional, in case you want to keep track
 
+# def go_to_unlabeled_tests():
+#     target_dir = os.path.join('outcomes', 'unlabeled_tests')
+    
+#     if not os.path.isdir(target_dir):
+#         raise FileNotFoundError(f"[ERROR] Directory '{target_dir}' does not exist.")
+    
+#     os.chdir(target_dir)
+#     print(f"[INFO] Changed working directory to: {target_dir}")
+#     return target_dir
+
 def go_to_unlabeled_tests():
-    target_dir = os.path.join('outcomes', 'unlabeled_tests')
-    
-    if not os.path.isdir(target_dir):
-        raise FileNotFoundError(f"[ERROR] Directory '{target_dir}' does not exist.")
-    
+    target_dir = os.path.join("outcomes", "unlabeled_tests")
+    os.makedirs(target_dir, exist_ok=True)   # create if missing (incl. parents)
     os.chdir(target_dir)
     print(f"[INFO] Changed working directory to: {target_dir}")
     return target_dir
-
-def gaussian_blur_kernel(sigma_px, device):
-    r = int(max(1, 3 * sigma_px))
-    xs = torch.arange(-r, r + 1, device=device).float()
-    g = torch.exp(-(xs**2) / (2 * float(sigma_px)**2))
-    k = (g[:, None] * g[None, :])
-    k /= k.sum()
-    return k[None, None, :, :]  # (1,1,H,W)
-
-def correlated_uniform_01(h, w, sigma_px=6, device='cpu', dtype=torch.float32, eps=1e-12):
-    # start with U[0,1), blur to add spatial coherence
-    z = torch.rand(1, 1, h, w, device=device, dtype=dtype)
-    k = gaussian_blur_kernel(sigma_px, device).to(dtype)
-    y = F.conv2d(z, k, padding=k.shape[-1] // 2)
-
-    # normalize to [0,1] robustly
-    y_min = y.amin(dim=(2, 3), keepdim=True)
-    y_max = y.amax(dim=(2, 3), keepdim=True)
-    y = (y - y_min) / (y_max - y_min + eps)
-    return y[0, 0]
 
 def coarse_uniform_01(H, W, cells=3, device='cpu'):
     # draw on a tiny grid, then bilinear upsample
@@ -412,22 +202,11 @@ def coarse_uniform_01(H, W, cells=3, device='cpu'):
     # strictly [0,1]
     return y
 
-def pad_and_binarise(tensor, target_shape, binarise = False):
-    top = bottom = (target_shape[0] - tensor.shape[0]) // 2
-    left = right = (target_shape[1] - tensor.shape[1]) // 2
-
-    padded = F.pad(tensor, (left, right, top, bottom), mode='constant', value=0)
-
-    # out = padded.to(torch.uint8).cpu().numpy() if binarise else padded
-
-    return padded
-
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    
     
 def auto_T_for_energy(ee_target: float = 0.98) -> float:
     """Return T so a 2D Gaussian truncated at R=T·σ contains ee_target encircled energy."""

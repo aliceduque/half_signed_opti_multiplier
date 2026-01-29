@@ -1,11 +1,5 @@
-import argparse
-import math
-import torch
-import time
-import random
-import os
-import gc
-# import psutil
+import argparse, math, torch, time, random, os, gc
+from pathlib import Path
 from dict import generate_linear_alphabet, generate_dither_alphabet
 from slm import SLM, SLM_Processing
 from dmd import DMD, DMD_Processing
@@ -24,7 +18,6 @@ def opti_product(kwargs):
     input_type        = kwargs.get("input_type")
     dataset           = kwargs.get("dataset")
     input_size        = kwargs.get("input_size")
-    chequered         = kwargs.get("chequered")
     wlen              = kwargs.get("wlen")
     focal_length      = kwargs.get("focal_length")
     dmd_pixels        = kwargs.get("dmd_pixels")
@@ -40,11 +33,9 @@ def opti_product(kwargs):
     cluster_size      = kwargs.get("cluster_size")
     scale             = kwargs.get("scale")
     bias              = kwargs.get("bias")
-    frame_of_zeros    = kwargs.get("frame_of_zeros")
     runs              = kwargs.get("runs")
     find_linear_fit   = kwargs.get("find_linear_fit")
     seed              = kwargs.get("seed")
-    E0                = kwargs.get("E0")
     pupil             = kwargs.get("pupil")
     waist             = kwargs.get("waist")
     crosstalk         = kwargs.get("crosstalk")
@@ -52,11 +43,10 @@ def opti_product(kwargs):
     zoom_misalign     = kwargs.get("zoom_misalign")
     shot_noise        = kwargs.get("shot_noise")
     fwc               = kwargs.get("fwc")
-    tau               = kwargs.get("tau")
 
     scale = torch.tensor(scale)
     bias = torch.tensor(bias)
-    DMD.alphabet = generate_linear_alphabet(cluster_size) if chequered else generate_dither_alphabet(cluster_size)
+    DMD.alphabet = generate_dither_alphabet(cluster_size)
     tau = None
     if shot_noise is None:
         shot_noise = False
@@ -69,12 +59,12 @@ def opti_product(kwargs):
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    print(f"Program running on {device}")
     if seed is not None:
         set_seed(seed)
             
     dmd_device = DMD(pitch=dmd_pitch,
                      num_pixels=dmd_pixels,
-                     frame_of_zeros=frame_of_zeros,
                      x0=x0_dmd,
                      y0=y0_dmd)
     
@@ -84,7 +74,6 @@ def opti_product(kwargs):
                     fill_factor=0.956,
                     wlen=wlen,
                     focal_length=focal_length,
-                    chequered=chequered,
                     crosstalk_sigma=crosstalk)
     
     image_dmd = Image(image_size = input_size,
@@ -119,15 +108,30 @@ def opti_product(kwargs):
     
     
     def propagate_and_read(quantised_reading=False, norm_to_E0=False, misalign=zoom_misalign):
+        """
+        Operate vectors by propagating field through modulated devices and performing focal plane detection
+        Args:
+            quantised_reading: If enabled, returns in digital value; else, returns in number of electrons
+            norm_to_E0: If enabled, performs the non-linear operation to extract n from Nr, and returns n
+            misalign: (a1,a2,a3,a4) tuple referent to 4f relay misalignment
+        Returns:
+            During bright/dark level calibration (quantised reading = False, norm_to_E0 = False):
+                reading: number of electrons
+                tau_out: exposure time, adjusted to reach FWC
+            During E0 calibration (quantised reading = True, norm_to_E0 = False):
+                reading_quant: number of electrons, expressed as digital value, placed in dark-to-bright digital scale
+            During normal operation (quantised reading = True, norm_to_E0 = True):
+                opti_result: optical reading, already normalised to E0 and quantised
+                digi_result: expected digital result, from input vectors
+        """
         with torch.inference_mode():
             field.reset()
             propagation(field=field,
                         dmd = dmd_proc,
                         slm = slm_proc,
                         waist = waist,
-                        pupil_radii = pupil,
+                        pupil_radius = pupil,
                         misalign = misalign)
-            print('shot noise: ', shot_noise)
             reading, tau_out = capture_focal_intensity(field = field,
                                         slm = slm_proc,
                                         tau=tau,
@@ -149,7 +153,9 @@ def opti_product(kwargs):
                 
     calibration_rep = 5 if shot_noise else 1
     
+    print("==== STARTING CALIBRATION ====")
     
+    print("Defining brightest pixel level")
 # Camera calibration: defining BRIGHT level
     set_input_type("fully_lit", image_dmd, image_slm)
     image_dmd.set_all_ones()
@@ -166,10 +172,11 @@ def opti_product(kwargs):
 
     E_bright = (E_capt / calibration_rep).max()
     tau = tau_acc / calibration_rep
-    print("Exposure time tau = ", tau)
+    print(f"Exposure time tau = {tau.detach().cpu().numpy()} seconds")
     kwargs.update({"tau": tau})
-    print(f"Upper threshrold E_bright = {E_bright.detach().cpu().tolist()}")
-        
+    print(f"Upper threshrold E_bright = {E_bright.detach().cpu().numpy()}")
+    
+    print("Defining darkest pixel level")
 # Camera calibration: defining BLACK level
     image_dmd.set_all_ones()
     image_slm.set_custom_input(value=-1.0)
@@ -180,62 +187,71 @@ def opti_product(kwargs):
     E_dim = (E_capt / calibration_rep).min()
     # E_dim = torch.tensor(10.0, device='cuda')
     # print("E_dim pushed to 10 electrons")
-    print(f"Lower threshrold E_dim = {E_dim.detach().cpu().tolist()}")
+    print(f"Lower threshrold E_dim = {E_dim.detach().cpu().numpy()}")
 
     cam_low, cam_high = define_limits_camera_ADC(dim=E_dim, bright=E_bright)
     
-    print(f'cam high: {cam_high}, cam low: {cam_low}')
+    print("Camera DV-to-electrons limits:")
+    print(f'Cam high: {cam_high}, Cam low: {cam_low}')
     DV_offset = (2**cam_adc_bits - 1) * cam_low / (cam_high - cam_low + 1e-9)
-    print('DV offset: ',DV_offset)
+    print('Digital Value offset: ',DV_offset.detach().cpu().numpy())
     
 # System calibration: defining reference intensity (E0)
+    print("Defining reference intensity E0:")
+    set_input_type("frame_only", image_dmd, image_slm)
+    E_capt = torch.zeros((lenslets, lenslets, pix_block_size, pix_block_size), device=device, dtype=torch.float32)
+    for _ in range(calibration_rep):
+        E_capt += propagate_and_read(quantised_reading=True)
 
-    if E0 is None:
-        set_input_type("frame_only", image_dmd, image_slm)
-        E_capt = torch.zeros((lenslets, lenslets, pix_block_size, pix_block_size), device=device, dtype=torch.float32)
-        for _ in range(calibration_rep):
-            E_capt += propagate_and_read(quantised_reading=True)
+    E0 = (E_capt / calibration_rep).sum(dim=(-2,-1))
+    
+    print(f"E0 = \n{E0.detach().cpu().numpy()}")
+    kwargs.update({"E0": E0})
 
-        E0 = (E_capt / calibration_rep).sum(dim=(-2,-1))
-        
-        print(f"Calibration complete. E0 = {E0.detach().cpu().tolist()}")
-        kwargs.update({"E0": E0})
+    print("==== CALIBRATION COMPLETE ====")
 
 # Finding linear parameters (least squares)
     if find_linear_fit:
         correct    = torch.empty((runs, lenslets, lenslets), device="cpu", dtype=torch.float32)
         contestant = torch.empty((runs, lenslets, lenslets), device="cpu", dtype=torch.float32)
         for run in range(runs):
-            set_input_type(input_type, image_dmd, image_slm, fully_signed=False, dataset=dataset)
+            print(f'[Run {run+1}/{runs}]') 
+            set_input_type(input_type, image_dmd, image_slm, dataset=dataset)
             opti_result, digi_result = propagate_and_read(quantised_reading=True, norm_to_E0=True)
             contestant[run] = opti_result
             correct[run] = digi_result
-            print(f'[Run {run+1}/{runs}] \nOptical result = \n{opti_result.detach().cpu().tolist()} \nDigital result = \n{digi_result.detach().cpu().tolist()}')
+            print(f'Optical result = \n{opti_result.detach().cpu().numpy()} \nDigital result = \n{digi_result.detach().cpu().numpy()}')
             
         scale, bias = find_scale_and_bias(correct,contestant)
         kwargs.update({"scale": scale, "bias": bias})
-        print(f'Linear fitting done: scale = {scale} | bias = {bias}')
+        print(f'Linear fitting done:\n Scale = \n{scale.detach().cpu().numpy()}\n Bias = \n{bias.detach().cpu().numpy()}')
         fitted_optical = scale * contestant + bias
         error_metrics = calculate_errors(correct, fitted_optical, lens_wise=True)
-        print(error_metrics)      
+        print("\n".join(f"{k}:\n {v}" for k, v in error_metrics.items()))      
         
 # If scale and biases pre-defined, then run:
     else:
+        print(f"Assuming scale = {scale} and bias = {bias}")
         correct = torch.empty((runs, lenslets, lenslets), device="cpu", dtype=torch.float32)
         fitted_optical = torch.empty((runs, lenslets, lenslets), device="cpu", dtype=torch.float32)
         for run in range(runs):
-            set_input_type(input_type, image_dmd, image_slm, dataset, fully_signed=False)
+            set_input_type(input_type, image_dmd, image_slm, dataset)
             opti_result, digi_result = propagate_and_read(quantised_reading=True, norm_to_E0=True)
             opti_result = scale*opti_result + bias
             fitted_optical[run] = opti_result
             correct[run] = digi_result
-            # print(f'Opti result: {opti_result} // Digit result: {digi_result}')        
+            print(f'Optical result: \n{opti_result.detach().cpu().numpy()}')
+            print(f'Digital result: \n{digi_result.detach().cpu().numpy()}')        
+        error_metrics = calculate_errors(correct, fitted_optical, lens_wise=True)
+        print("\n".join(f"{k}: {v}" for k, v in error_metrics.items()))      
+
+    Path("/outcomes").mkdir(parents=True, exist_ok=True)
 
     if title is not None:
         create_outcome_dir(title)
     else:
         go_to_unlabeled_tests()
-    log_to_file(kwargs, correct, fitted_optical)
+    log_to_file(kwargs, correct, fitted_optical, error_metrics)
     
     return error_metrics
 
@@ -251,7 +267,6 @@ if __name__ == '__main__':
     parser.add_argument("--input_type", default="random_uncorr", type=str, help="Options: \'fully_lit\', \'frame_only\', \'custom\', \'random\'")
     parser.add_argument("--dataset", default="cifar", type=str, help="Dataset for Random input type (options: CIFAR and QuickDraw)")
     parser.add_argument("--input_size", default=45, type=int, help="Vector size to be operated (per side)")
-    parser.add_argument("--chequered", default=False, type=bool, help="If True, chequered phase mask is used; if False, striped (ordered dithering) is used")  
     parser.add_argument("--wlen", default=650e-9, type=float, help="Beam wavelength")  
     parser.add_argument("--focal_length", default=425e-3, type=float, help="Focal length of SLM lens phase profile")
     parser.add_argument("--dmd_pixels", default=1024, type=int, help="Number NxN of pixels in the DMD (per dimension)")
@@ -267,18 +282,16 @@ if __name__ == '__main__':
     parser.add_argument("--cluster_size", default=16, type=int, help="Cluster size used on DMD for image encoding")
     parser.add_argument('--scale', default=1.0, type=float, help="Pre-determined scale")
     parser.add_argument('--bias', default=0.0, type=float, help="Pre-determined bias")
-    parser.add_argument('--frame_of_zeros', default=False, type=bool, help="For testing, omit the frame")
     parser.add_argument('--runs', default=100, type=int, help="Number of runs performed")
     parser.add_argument('--find_linear_fit', default=False, type=bool, help="Do many runs and find linear parameters to fit data")
     parser.add_argument('--seed', default=None, type=int, help="Random seed to be used")
-    parser.add_argument('--E0', default=None, type=float, help="Intensity of reference beam. If not specified, calibration is performed to calculate E0.")
     parser.add_argument('--pupil', default=None, type=float, help="Pupil radius to be included in the 4f-system fourier plane")
     parser.add_argument('--waist', default=None, type=float, help="Beam waist after beam expansion")
     parser.add_argument('--xy_misalign', default=None, type=float, help="XY deviation of SLM with respect to beam central position. (x0,y0) tuple expected in meters")
     parser.add_argument('--zoom_misalign', default=None, type=float, help="Longitudinal deviation in the 4f relay. (d1,d2,d3,d4) tuple expected in meters")   
     parser.add_argument('--crosstalk', default=0.0, type=float, help="SLM crosstalk sigma (as a factor of pixel pitch)" )
     parser.add_argument('--shot_noise', default=False, type=bool, help="Enable shot noise")
-    parser.add_argument('--fwc', default=10000, type=int, help="Full Well Capacity of camera")
+    parser.add_argument('--fwc', default=None, type=int, help="Full Well Capacity of camera")
     p = parser.parse_args()
 
     kwargs = vars(p)      
